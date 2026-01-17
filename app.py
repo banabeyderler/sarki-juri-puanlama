@@ -3,20 +3,14 @@ import pandas as pd
 from datetime import datetime
 import uuid
 
-# Optional Google Sheets
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
+import gspread
+from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Şarkı Etkinliği Jüri Sistemi", page_icon="🎵", layout="wide")
+st.set_page_config(page_title="Lamajör Jüri Puanlama", page_icon="🎵", layout="wide")
 
 ADMIN_USER = "DEVIL"
 ADMIN_DISPLAY = "𓏢 ÐEVłŁ'S✞BE¥"
 
-JUDGE_USERS = ["DEVIL", "JURI1", "JURI2", "JURI3", "JURI4", "JURI5"]
 JUDGE_DISPLAY = {
     "DEVIL": ADMIN_DISPLAY,
     "JURI1": "Jüri 1",
@@ -24,479 +18,266 @@ JUDGE_DISPLAY = {
     "JURI3": "Jüri 3",
     "JURI4": "Jüri 4",
     "JURI5": "Jüri 5",
+    "JURI6": "Jüri 6",
 }
 
-# ----------------------------
-# Auth helpers
-# ----------------------------
-
-def get_passwords():
-    # Secrets varsa oradan al, yoksa demo
-    if "judges" in st.secrets:
-        return dict(st.secrets["judges"])
-    # Demo passwords (kalıcı değil)
-    return {
-        "DEVIL": "devil",
-        "JURI1": "1234",
-        "JURI2": "1234",
-        "JURI3": "1234",
-        "JURI4": "1234",
-        "JURI5": "1234",
-    }
-
-
-def check_login(username: str, password: str) -> bool:
-    pw = get_passwords()
-    return username in pw and str(pw[username]) == str(password)
-
-
-def is_admin(user: str | None) -> bool:
-    return user == ADMIN_USER
-
-
-# ----------------------------
-# Storage layer (Google Sheets preferred)
-# ----------------------------
-
-def secrets_ready() -> bool:
-    return (
-        gspread is not None
-        and "SHEET_ID" in st.secrets
-        and "service_account" in st.secrets
-    )
-
-
 @st.cache_resource
-def get_gs_client():
+def gs_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds_info = dict(st.secrets["service_account"])
-    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    creds = Credentials.from_service_account_info(st.secrets["gcp"], scopes=scopes)
     return gspread.authorize(creds)
 
+def spreadsheet():
+    return gs_client().open_by_key(st.secrets["google"]["spreadsheet_id"])
 
-def get_sheet():
-    gc = get_gs_client()
-    return gc.open_by_key(st.secrets["SHEET_ID"])
-
-
-def ensure_worksheets():
-    sh = get_sheet()
-    titles = [ws.title for ws in sh.worksheets()]
+def ensure_tabs():
+    sh = spreadsheet()
+    titles = [w.title for w in sh.worksheets()]
 
     if "votes" not in titles:
-        ws = sh.add_worksheet(title="votes", rows=5000, cols=10)
+        ws = sh.add_worksheet("votes", rows=5000, cols=10)
         ws.append_row(["id", "ts", "judge", "contestant", "score"])
 
     if "contestants" not in titles:
-        ws = sh.add_worksheet(title="contestants", rows=500, cols=5)
+        ws = sh.add_worksheet("contestants", rows=500, cols=5)
         ws.append_row(["name"])
         ws.append_rows([["Yarışmacı 1"], ["Yarışmacı 2"], ["Yarışmacı 3"]])
 
-    if "config" not in titles:
-        ws = sh.add_worksheet(title="config", rows=50, cols=5)
+    if "settings" not in titles:
+        ws = sh.add_worksheet("settings", rows=50, cols=5)
         ws.append_row(["key", "value"])
-        ws.append_row(["voting_open", "1"])  # default open
+        ws.append_row(["voting_open", "1"])              # 1 açık / 0 kapalı
+        ws.append_row(["hide_judges_from_viewers", "1"]) # 1 gizle / 0 göster
 
+def read_settings():
+    ws = spreadsheet().worksheet("settings")
+    rows = ws.get_all_values()
+    d = {}
+    for r in rows[1:]:
+        if len(r) >= 2:
+            d[r[0]] = r[1]
+    return d
 
-def now_ts():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def load_votes_df():
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("votes")
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return pd.DataFrame(columns=["id", "ts", "judge", "contestant", "score"])
-        df = pd.DataFrame(values[1:], columns=values[0])
-        if not df.empty:
-            df["score"] = pd.to_numeric(df["score"], errors="coerce")
-        return df
-
-    # Demo storage
-    if "votes_demo" not in st.session_state:
-        st.session_state["votes_demo"] = []
-    df = pd.DataFrame(st.session_state["votes_demo"], columns=["id", "ts", "judge", "contestant", "score"])
-    if not df.empty:
-        df["score"] = pd.to_numeric(df["score"], errors="coerce")
-    return df
-
+def set_setting(key: str, value: str):
+    ws = spreadsheet().worksheet("settings")
+    rows = ws.get_all_values()
+    for i, r in enumerate(rows[1:], start=2):
+        if r and r[0] == key:
+            ws.update(f"B{i}", value)
+            return
+    ws.append_row([key, value])
 
 def load_contestants():
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("contestants")
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return []
-        return [r[0].strip() for r in values[1:] if r and r[0].strip()]
-
-    if "contestants_demo" not in st.session_state:
-        st.session_state["contestants_demo"] = ["Yarışmacı 1", "Yarışmacı 2", "Yarışmacı 3"]
-    return list(st.session_state["contestants_demo"])
-
+    ws = spreadsheet().worksheet("contestants")
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return []
+    return [r[0].strip() for r in rows[1:] if r and r[0].strip()]
 
 def add_contestant(name: str):
     name = name.strip()
     if not name:
         return
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("contestants")
-        ws.append_row([name])
-        return
-    st.session_state.setdefault("contestants_demo", []).append(name)
+    spreadsheet().worksheet("contestants").append_row([name])
 
+def load_votes_df():
+    ws = spreadsheet().worksheet("votes")
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return pd.DataFrame(columns=["id", "ts", "judge", "contestant", "score"])
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    return df
 
-def get_voting_open() -> bool:
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("config")
-        values = ws.get_all_values()
-        # key/value rows
-        for r in values[1:]:
-            if len(r) >= 2 and r[0] == "voting_open":
-                return str(r[1]).strip() == "1"
-        # fallback
-        ws.append_row(["voting_open", "1"])
-        return True
+def append_or_update_vote(judge: str, contestant: str, score: int):
+    ws = spreadsheet().worksheet("votes")
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        ws.append_row(["id", "ts", "judge", "contestant", "score"])
+        rows = ws.get_all_values()
 
-    return st.session_state.get("voting_open_demo", True)
+    header = rows[0]
+    data = rows[1:]
 
+    # sütunlar
+    id_i = header.index("id")
+    ts_i = header.index("ts")
+    judge_i = header.index("judge")
+    cont_i = header.index("contestant")
+    score_i = header.index("score")
 
-def set_voting_open(open_: bool):
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("config")
-        values = ws.get_all_values()
-        # find row
-        for idx, r in enumerate(values[1:], start=2):
-            if len(r) >= 2 and r[0] == "voting_open":
-                ws.update_cell(idx, 2, "1" if open_ else "0")
-                return
-        ws.append_row(["voting_open", "1" if open_ else "0"])
-        return
-
-    st.session_state["voting_open_demo"] = open_
-
-
-def upsert_vote(judge: str, contestant: str, score: int):
-    """One vote per judge per contestant. Updates if exists."""
-    contestant = contestant.strip()
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("votes")
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            # header only
-            row_id = str(uuid.uuid4())
-            ws.append_row([row_id, now_ts(), judge, contestant, int(score)])
-            return "insert"
-
-        header = values[0]
-        rows = values[1:]
-        j_col = header.index("judge")
-        c_col = header.index("contestant")
-        s_col = header.index("score")
-        t_col = header.index("ts")
-
-        # search for existing (first match)
-        for i, r in enumerate(rows, start=2):
-            if len(r) > max(j_col, c_col) and r[j_col] == judge and r[c_col] == contestant:
-                # update score + ts
-                ws.update_cell(i, s_col + 1, str(int(score)))
-                ws.update_cell(i, t_col + 1, now_ts())
-                return "update"
-
-        row_id = str(uuid.uuid4())
-        ws.append_row([row_id, now_ts(), judge, contestant, int(score)])
-        return "insert"
-
-    # Demo
-    st.session_state.setdefault("votes_demo", [])
-    # find
-    for rec in st.session_state["votes_demo"]:
-        if rec["judge"] == judge and rec["contestant"] == contestant:
-            rec["score"] = int(score)
-            rec["ts"] = now_ts()
+    # update varsa güncelle
+    for row_idx, r in enumerate(data, start=2):
+        if len(r) > max(judge_i, cont_i) and r[judge_i] == judge and r[cont_i] == contestant:
+            def col(n): return chr(ord("A") + n)
+            ws.update(f"{col(score_i)}{row_idx}", str(int(score)))
+            ws.update(f"{col(ts_i)}{row_idx}", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             return "update"
-    st.session_state["votes_demo"].append({
-        "id": str(uuid.uuid4()),
-        "ts": now_ts(),
-        "judge": judge,
-        "contestant": contestant,
-        "score": int(score),
-    })
+
+    # yoksa ekle
+    ws.append_row([
+        str(uuid.uuid4()),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        judge,
+        contestant,
+        int(score)
+    ])
     return "insert"
 
-
-def admin_delete_votes(ids_to_delete: set[str]) -> int:
-    if not ids_to_delete:
+def admin_delete_votes_for_contestant(contestant: str) -> int:
+    ws = spreadsheet().worksheet("votes")
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
         return 0
+    header = rows[0]
+    cont_i = header.index("contestant")
 
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("votes")
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return 0
-        header = values[0]
-        rows = values[1:]
-        id_col = header.index("id")
-        delete_row_numbers = []
-        for i, r in enumerate(rows, start=2):
-            if len(r) > id_col and r[id_col] in ids_to_delete:
-                delete_row_numbers.append(i)
-        for rn in sorted(delete_row_numbers, reverse=True):
-            ws.delete_rows(rn)
-        return len(delete_row_numbers)
+    delete_rows = []
+    for idx, r in enumerate(rows[1:], start=2):
+        if len(r) > cont_i and r[cont_i] == contestant:
+            delete_rows.append(idx)
 
-    # Demo
-    before = len(st.session_state.get("votes_demo", []))
-    st.session_state["votes_demo"] = [r for r in st.session_state.get("votes_demo", []) if r.get("id") not in ids_to_delete]
-    return before - len(st.session_state["votes_demo"])
+    for rn in sorted(delete_rows, reverse=True):
+        ws.delete_rows(rn)
+    return len(delete_rows)
 
+def admin_reset_all_votes():
+    ws = spreadsheet().worksheet("votes")
+    ws.clear()
+    ws.append_row(["id", "ts", "judge", "contestant", "score"])
 
-def admin_edit_vote(vote_id: str, new_score: int) -> bool:
-    """Admin can edit any vote score."""
-    if secrets_ready():
-        sh = get_sheet()
-        ws = sh.worksheet("votes")
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            return False
-        header = values[0]
-        rows = values[1:]
-        id_col = header.index("id")
-        s_col = header.index("score")
-        t_col = header.index("ts")
-        for i, r in enumerate(rows, start=2):
-            if len(r) > id_col and r[id_col] == vote_id:
-                ws.update_cell(i, s_col + 1, str(int(new_score)))
-                ws.update_cell(i, t_col + 1, now_ts())
-                return True
-        return False
+# --- start ---
+ensure_tabs()
+settings = read_settings()
+voting_open = settings.get("voting_open", "1") == "1"
+hide_judges = settings.get("hide_judges_from_viewers", "1") == "1"
 
-    for rec in st.session_state.get("votes_demo", []):
-        if rec.get("id") == vote_id:
-            rec["score"] = int(new_score)
-            rec["ts"] = now_ts()
-            return True
-    return False
-
-
-# ----------------------------
-# UI
-# ----------------------------
-
-st.title("🎵 Şarkı Etkinliği – Jüri Puanlama")
-
-if not secrets_ready():
-    st.warning(
-        "Şu an **Demo Mode** aktif: Google Sheets Secrets ayarlı değil. "
-        "Bu modda veriler kalıcı değildir (deploy/restart olunca silinebilir).\n\n"
-        "Kalıcı kayıt için `secrets_template.toml` dosyasındaki adımları uygulayıp Streamlit Secrets’i doldur."
-    )
-else:
-    try:
-        ensure_worksheets()
-    except Exception as e:
-        st.error("Google Sheets bağlantısında sorun var. Secrets/izinleri kontrol et.")
-        st.exception(e)
-
-# Session login
+# session
 if "user" not in st.session_state:
-    st.session_state["user"] = None
+    st.session_state.user = None
+if "display_name" not in st.session_state:
+    st.session_state.display_name = "İzleyici"
 
-# Sidebar Login
+def is_admin(u): return u == ADMIN_USER
+
+# Sidebar login
 with st.sidebar:
-    st.header("🔐 Jüri Girişi")
-
-    if st.session_state["user"] is None:
-        u = st.selectbox("Kullanıcı", JUDGE_USERS)
+    st.header("🔐 Giriş")
+    if st.session_state.user is None:
+        u = st.selectbox("Kullanıcı", list(st.secrets["judges"].keys()))
         p = st.text_input("Şifre", type="password")
         if st.button("Giriş Yap"):
-            if check_login(u, p):
-                st.session_state["user"] = u
-                st.success(f"Giriş başarılı: {JUDGE_DISPLAY.get(u,u)}")
+            if str(st.secrets["judges"][u]) == str(p):
+                st.session_state.user = u
+                st.session_state.display_name = JUDGE_DISPLAY.get(u, u)
+                st.success(f"Giriş: {st.session_state.display_name}")
                 st.rerun()
             else:
-                st.error("Kullanıcı/şifre hatalı")
-        st.caption("Giriş yapmazsan izleyici olarak sadece sonuçları görürsün.")
+                st.error("Şifre yanlış")
+        st.caption("Giriş yapmazsan izleyici olarak sonuçları görürsün.")
     else:
-        st.success(f"Aktif: {JUDGE_DISPLAY.get(st.session_state['user'], st.session_state['user'])}")
-        if st.button("Çıkış"):
-            st.session_state["user"] = None
+        st.success(f"Giriş: {st.session_state.display_name}")
+        if st.button("Çıkış Yap"):
+            st.session_state.user = None
+            st.session_state.display_name = "İzleyici"
             st.rerun()
 
-    st.divider()
-    st.subheader("Durum")
-    open_ = get_voting_open()
-    st.write("🟢 Oylama Açık" if open_ else "🔴 Oylama Kapalı")
+st.title("🎵 Lamajör Jüri Puanlama Sistemi")
 
-    if is_admin(st.session_state["user"]):
-        toggle = st.toggle("Oylamayı Aç/Kapat", value=open_)
-        if toggle != open_:
-            set_voting_open(toggle)
-            st.rerun()
+user = st.session_state.user
 
-# Load data
-contestants = load_contestants()
-votes_df = load_votes_df()
-
-# Layout: left results, right voting
 left, right = st.columns([2, 1], gap="large")
 
-# ----------------------------
-# LEFT: Leaderboard + viewer
-# ----------------------------
+# LEFT: results
 with left:
-    st.subheader("🏆 Sıralama")
+    st.subheader("📊 Canlı Sıralama")
+    votes_df = load_votes_df()
 
     if votes_df.empty:
-        st.info("Henüz oy girilmedi.")
+        st.info("Henüz oy yok.")
     else:
-        # Tie-break: total desc, avg desc, count of 10s desc, name asc
-        v = votes_df.dropna(subset=["score"]).copy()
-        v["score"] = pd.to_numeric(v["score"], errors="coerce")
+        show_df = votes_df.copy()
+        if user is None and hide_judges:
+            show_df["judge"] = "Jüri"
 
-        total = v.groupby("contestant", as_index=False)["score"].sum().rename(columns={"score": "toplam"})
-        avg = v.groupby("contestant", as_index=False)["score"].mean().rename(columns={"score": "ortalama"})
-        tens = v.assign(is10=(v["score"] == 10)).groupby("contestant", as_index=False)["is10"].sum().rename(columns={"is10": "on_sayisi"})
+        agg = votes_df.groupby("contestant", as_index=False).agg(
+            total_score=("score", "sum"),
+            avg_score=("score", "mean"),
+            vote_count=("score", "count")
+        )
+        agg = agg.sort_values(["total_score", "avg_score", "vote_count"], ascending=[False, False, False]).reset_index(drop=True)
+        agg.insert(0, "rank", range(1, len(agg) + 1))
+        st.dataframe(agg, use_container_width=True)
 
-        board = total.merge(avg, on="contestant", how="outer").merge(tens, on="contestant", how="outer")
-        board["ortalama"] = board["ortalama"].round(2)
-        board["on_sayisi"] = board["on_sayisi"].fillna(0).astype(int)
+        with st.expander("🧾 Tüm Oylar (detay)"):
+            st.dataframe(show_df.sort_values("ts", ascending=False), use_container_width=True)
 
-        board = board.sort_values(by=["toplam", "ortalama", "on_sayisi", "contestant"], ascending=[False, False, False, True]).reset_index(drop=True)
-        board.insert(0, "Sıra", board.index + 1)
-
-        st.dataframe(board, use_container_width=True, hide_index=True)
-
-        winner = board.iloc[0]["contestant"]
-        st.success(f"🏆 Şu an 1. sırada: **{winner}**")
-
-    st.divider()
-
-    # Admin-only insights
-    if is_admin(st.session_state["user"]):
-        st.subheader("📊 Jüri İlerlemesi (Admin)")
-        total_cont = max(len(contestants), 1)
-        if contestants and not votes_df.empty:
-            prog_rows = []
-            for u in JUDGE_USERS:
-                jname = JUDGE_DISPLAY.get(u, u)
-                count = int((votes_df["judge"] == u).sum())
-                prog_rows.append({"Jüri": jname, "Verilen Oy": count, "Toplam Yarışmacı": total_cont})
-            prog = pd.DataFrame(prog_rows)
-            st.dataframe(prog, use_container_width=True, hide_index=True)
-        else:
-            st.info("İlerleme için yarışmacı ve en az 1 oy olmalı.")
-
-        st.subheader("👥 Yarışmacı Ekle (Admin)")
-        new_name = st.text_input("Yeni yarışmacı adı", placeholder="Örn: Abdullah")
-        if st.button("➕ Ekle"):
-            if new_name.strip():
-                add_contestant(new_name.strip())
-                st.success("Yarışmacı eklendi")
-                st.rerun()
-            else:
-                st.warning("İsim boş olamaz")
-
-    st.divider()
-
-    st.subheader("👀 İzleyici Bilgisi")
-    st.caption("Giriş yapmayanlar sadece sıralamayı görür. Jüri isimleri izleyicide gösterilmez.")
-
-# ----------------------------
-# RIGHT: Voting panel (on the right)
-# ----------------------------
+# RIGHT: scoring panel
 with right:
-    st.subheader("🗳️ Puan Girişi")
-
-    user = st.session_state["user"]
-    open_ = get_voting_open()
+    st.subheader("🎤 Puan Paneli")
+    contestants = load_contestants()
 
     if user is None:
-        st.info("Puan vermek için jüri girişi yapmalısın.")
-    elif not open_:
-        st.warning("Oylama şu an kapalı. Admin açınca puan girebilirsin.")
+        st.info("İzleyicisin. Puan vermek için giriş yap.")
     else:
-        if not contestants:
-            st.warning("Yarışmacı listesi boş. Admin yarışmacı eklemeli.")
+        if (not voting_open) and (not is_admin(user)):
+            st.warning("Oylama şu an kapalı. Admin açınca puan verebilirsin.")
         else:
-            st.write(f"Aktif Jüri: **{JUDGE_DISPLAY.get(user, user)}**")
-
-            contestant = st.selectbox("Yarışmacı", contestants)
-
-            # Current vote for this pair
-            existing = None
-            if not votes_df.empty:
-                m = (votes_df["judge"] == user) & (votes_df["contestant"] == contestant)
-                if m.any():
-                    existing = votes_df[m].iloc[0]
-
-            # 1-10 as buttons
-            st.caption("Puanı seç (1–10)")
-            btn_cols = st.columns(5)
-            selected = st.session_state.get("selected_score", 8)
-
-            for i, score in enumerate(range(1, 11)):
-                with btn_cols[i % 5]:
-                    if st.button(str(score), use_container_width=True, key=f"scorebtn_{score}"):
-                        selected = score
-                        st.session_state["selected_score"] = score
-
-            st.write(f"Seçilen Puan: **{selected}**")
-
-            if existing is not None:
-                st.info(f"Bu yarışmacıya daha önce oy verdin: **{int(existing['score'])}**. Kaydet ile güncellenir.")
-
-            if st.button("✅ Kaydet / Güncelle", use_container_width=True):
-                action = upsert_vote(user, contestant, int(selected))
-                st.success("Oy kaydedildi." if action == "insert" else "Oy güncellendi.")
-                st.rerun()
-
-    st.divider()
-
-    # Admin tools: delete / edit
-    if is_admin(user):
-        st.subheader("🛠️ Admin: Puan Sil / Düzenle")
-        if votes_df.empty:
-            st.info("Silinecek/düzenlenecek oy yok.")
-        else:
-            # Show editor with delete checkbox
-            show = votes_df.copy()
-            # hide judges from viewer normally, but admin sees
-            show["judge_name"] = show["judge"].map(lambda x: JUDGE_DISPLAY.get(x, x))
-            show = show[["id", "ts", "judge_name", "contestant", "score"]].rename(columns={"judge_name": "jüri"})
-            show.insert(0, "Sil", False)
-
-            edited = st.data_editor(show, use_container_width=True, hide_index=True)
-
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.button("🗑️ Seçilenleri Sil", use_container_width=True):
-                    ids = set(edited.loc[edited["Sil"] == True, "id"].astype(str).tolist())
-                    n = admin_delete_votes(ids)
-                    st.success(f"Silindi: {n}")
+            if not contestants:
+                st.warning("Yarışmacı yok. Admin ekleyebilir.")
+            else:
+                c = st.selectbox("Yarışmacı", contestants)
+                s = st.radio("Puan", list(range(1, 11)), horizontal=True)
+                if st.button("✅ Puanı Kaydet / Güncelle"):
+                    action = append_or_update_vote(user, c, int(s))
+                    st.success("Puan kaydedildi ✅" if action == "insert" else "Puan güncellendi ✅")
                     st.rerun()
 
-            with c2:
-                st.caption("Düzenleme: aşağıdan bir kaydı seç")
+# Admin panel
+if is_admin(user):
+    st.divider()
+    st.subheader("👑 Admin Paneli")
 
-            # Simple edit by id
-            vote_ids = edited["id"].astype(str).tolist()
-            pick = st.selectbox("Düzenlenecek oy (id)", vote_ids)
-            new_score = st.slider("Yeni puan", 1, 10, 8)
-            if st.button("✏️ Puanı Güncelle", use_container_width=True):
-                ok = admin_edit_vote(pick, int(new_score))
-                st.success("Güncellendi" if ok else "Bulunamadı")
-                st.rerun()
+    a1, a2, a3 = st.columns(3)
 
-# Footer
-st.caption("Made for Lamajör etkinlikleri • İzleyici: sonuçları görür • Jüri: oy verir • Admin: yönetir")
+    with a1:
+        st.write("**Oylama Durumu**")
+        open_val = st.toggle("Oylama Açık", value=voting_open)
+        if st.button("Kaydet (Oylama)"):
+            set_setting("voting_open", "1" if open_val else "0")
+            st.success("Kaydedildi.")
+            st.rerun()
+
+    with a2:
+        st.write("**İzleyicide jüri isimleri**")
+        hide_val = st.toggle("İzleyicide gizle", value=hide_judges)
+        if st.button("Kaydet (Gizlilik)"):
+            set_setting("hide_judges_from_viewers", "1" if hide_val else "0")
+            st.success("Kaydedildi.")
+            st.rerun()
+
+    with a3:
+        st.write("**Yarışmacı Ekle**")
+        new_name = st.text_input("Yeni yarışmacı adı")
+        if st.button("➕ Ekle"):
+            add_contestant(new_name)
+            st.success("Yarışmacı eklendi.")
+            st.rerun()
+
+    st.markdown("### 🗑️ Puan Silme (Sadece Admin)")
+    contestants = load_contestants()
+    if contestants:
+        del_c = st.selectbox("Puanları silinecek yarışmacı", contestants)
+        if st.button("Bu yarışmacının TÜM puanlarını sil"):
+            n = admin_delete_votes_for_contestant(del_c)
+            st.success(f"{n} oy satırı silindi.")
+            st.rerun()
+
+    st.markdown("### ⚠️ Tüm oyları sıfırla")
+    if st.button("TÜM OYLARI SIFIRLA (geri dönüş yok)"):
+        admin_reset_all_votes()
+        st.success("Tüm oylar sıfırlandı.")
+        st.rerun()
